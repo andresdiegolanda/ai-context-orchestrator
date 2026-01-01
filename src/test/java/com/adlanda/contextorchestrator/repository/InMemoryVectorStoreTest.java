@@ -98,7 +98,7 @@ class InMemoryVectorStoreTest {
     }
 
     private DocumentChunk createChunkWithEmbedding(String id, String content, List<Double> embedding) {
-        return new DocumentChunk(id, content, "test.md", 0, embedding);
+        return new DocumentChunk(id, content, "test.md", 0, null, embedding);
     }
 
     private static org.assertj.core.data.Offset<Double> within(double value) {

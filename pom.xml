@@ -55,11 +55,17 @@
             <scope>runtime</scope>
         </dependency>
 
-        <!-- H2 for initial development (before PGVector) -->
+        <!-- H2 for testing -->
         <dependency>
             <groupId>com.h2database</groupId>
             <artifactId>h2</artifactId>
-            <scope>runtime</scope>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Spring AI PGVector for persistent vector storage (Iteration 2) -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-pgvector-store-spring-boot-starter</artifactId>
         </dependency>
 
         <!-- Validation -->

@@ -1,15 +1,40 @@
 package com.adlanda.contextorchestrator.service;
 
+import com.adlanda.contextorchestrator.config.IngestionProperties;
 import com.adlanda.contextorchestrator.model.DocumentChunk;
+import com.adlanda.contextorchestrator.repository.IngestedSourceRepository;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.when;
 
+@ExtendWith(MockitoExtension.class)
 class IngestionServiceTest {
 
-    private final IngestionService ingestionService = new IngestionService();
+    @Mock
+    private FileHashService fileHashService;
+
+    @Mock
+    private IngestedSourceRepository ingestedSourceRepository;
+
+    @Mock
+    private IngestionProperties ingestionProperties;
+
+    private IngestionService ingestionService;
+
+    @BeforeEach
+    void setUp() {
+        ingestionService = new IngestionService(fileHashService, ingestedSourceRepository, ingestionProperties);
+        // Mock hash computation to return a fixed hash for content-based calls
+        when(fileHashService.computeHash(anyString())).thenReturn("test-hash");
+    }
 
     @Test
     void chunkContent_singleParagraph_returnsSingleChunk() {
@@ -99,5 +124,14 @@ class IngestionServiceTest {
         List<DocumentChunk> chunks = ingestionService.chunkContent(content, "test.md");
 
         assertThat(chunks.get(0).hasEmbedding()).isFalse();
+    }
+
+    @Test
+    void chunkContent_chunksHaveFileHash() {
+        String content = "Simple content.";
+
+        List<DocumentChunk> chunks = ingestionService.chunkContent(content, "test.md");
+
+        assertThat(chunks.get(0).fileHash()).isEqualTo("test-hash");
     }
 }

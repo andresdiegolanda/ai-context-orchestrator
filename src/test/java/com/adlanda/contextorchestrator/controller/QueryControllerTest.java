@@ -83,7 +83,7 @@ class QueryControllerTest {
 
     @Test
     void getSources_returnsIndexStats() throws Exception {
-        when(retrievalService.getIndexSize()).thenReturn(42);
+        when(retrievalService.getIndexSize()).thenReturn(42L);
 
         mockMvc.perform(get("/api/v1/sources"))
                 .andExpect(status().isOk())
@@ -93,7 +93,7 @@ class QueryControllerTest {
 
     @Test
     void getSources_emptyIndex_returnsEmptyStatus() throws Exception {
-        when(retrievalService.getIndexSize()).thenReturn(0);
+        when(retrievalService.getIndexSize()).thenReturn(0L);
 
         mockMvc.perform(get("/api/v1/sources"))
                 .andExpect(status().isOk())

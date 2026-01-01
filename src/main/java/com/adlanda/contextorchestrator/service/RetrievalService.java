@@ -2,7 +2,8 @@ package com.adlanda.contextorchestrator.service;
 
 import com.adlanda.contextorchestrator.model.QueryResponse;
 import com.adlanda.contextorchestrator.model.QueryResult;
-import com.adlanda.contextorchestrator.repository.InMemoryVectorStore;
+import com.adlanda.contextorchestrator.repository.IngestedSourceRepository;
+import com.adlanda.contextorchestrator.repository.PgVectorStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -13,21 +14,23 @@ import java.util.List;
  * Service responsible for retrieving relevant context based on a query.
  *
  * Orchestrates the query flow:
- * 1. Embed the query
- * 2. Search for similar chunks
- * 3. Return ranked results
+ * 1. Search for similar chunks using PGVector
+ * 2. Return ranked results
+ *
+ * Iteration 2: Uses PGVector for persistent storage instead of in-memory store.
+ * The VectorStore handles embedding internally, so we don't need EmbeddingService here.
  */
 @Service
 public class RetrievalService {
 
     private static final Logger log = LoggerFactory.getLogger(RetrievalService.class);
 
-    private final EmbeddingService embeddingService;
-    private final InMemoryVectorStore vectorStore;
+    private final PgVectorStore vectorStore;
+    private final IngestedSourceRepository ingestedSourceRepository;
 
-    public RetrievalService(EmbeddingService embeddingService, InMemoryVectorStore vectorStore) {
-        this.embeddingService = embeddingService;
+    public RetrievalService(PgVectorStore vectorStore, IngestedSourceRepository ingestedSourceRepository) {
         this.vectorStore = vectorStore;
+        this.ingestedSourceRepository = ingestedSourceRepository;
     }
 
     /**
@@ -40,30 +43,29 @@ public class RetrievalService {
     public QueryResponse query(String question, int maxResults) {
         long startTime = System.currentTimeMillis();
 
-        // 1. Embed the query
-        List<Double> queryEmbedding = embeddingService.embed(question);
+        // Search for similar chunks (Spring AI VectorStore handles embedding internally)
+        List<PgVectorStore.ScoredChunk> scoredChunks = vectorStore.findSimilarByText(question, maxResults);
 
-        // 2. Search for similar chunks
-        List<InMemoryVectorStore.ScoredChunk> scoredChunks = vectorStore.findSimilar(queryEmbedding, maxResults);
-
-        // 3. Convert to results
+        // Convert to results
         List<QueryResult> results = scoredChunks.stream()
                 .map(sc -> QueryResult.from(sc.chunk(), sc.score()))
                 .toList();
 
         long queryTimeMs = System.currentTimeMillis() - startTime;
 
-        log.debug("Query '{}' returned {} results in {}ms",
-                truncate(question, 50), results.size(), queryTimeMs);
+        if (log.isDebugEnabled()) {
+            log.debug("Query '{}' returned {} results in {}ms",
+                    truncate(question, 50), results.size(), queryTimeMs);
+        }
 
-        return new QueryResponse(results, vectorStore.size(), queryTimeMs);
+        return new QueryResponse(results, (int) getIndexSize(), queryTimeMs);
     }
 
     /**
-     * Returns the number of chunks in the index.
+     * Returns the total number of chunks across all ingested files.
      */
-    public int getIndexSize() {
-        return vectorStore.size();
+    public long getIndexSize() {
+        return ingestedSourceRepository.sumChunkCount();
     }
 
     private String truncate(String s, int maxLen) {
