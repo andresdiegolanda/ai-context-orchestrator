@@ -34,7 +34,7 @@ export OPENAI_API_KEY=sk-your-key-here
 # API root (endpoint discovery)
 curl http://localhost:8080/api/v1
 
-# Health check (Spring Actuator)
+# Health check (includes ingestion status)
 curl http://localhost:8080/actuator/health
 
 # Query the indexed documents
@@ -49,20 +49,27 @@ curl -X POST http://localhost:8080/api/v1/query \
 ai-context-orchestrator/
 ├── src/main/java/com/adlanda/contextorchestrator/
 │   ├── OrchestratorApplication.java    # Main application
+│   ├── IngestionRunner.java            # Startup ingestion with health reporting
 │   ├── controller/                     # REST API endpoints
 │   ├── service/                        # Business logic
-│   │   ├── IngestionService.java       # Document chunking & ingestion
+│   │   ├── IngestionService.java       # Document chunking & incremental ingestion
 │   │   ├── EmbeddingService.java       # OpenAI embedding generation
 │   │   ├── RetrievalService.java       # Semantic search
 │   │   └── FileHashService.java        # Change detection (SHA-256)
 │   ├── repository/                     # Data access
-│   │   ├── PgVectorStore.java          # Vector similarity search
+│   │   ├── PgVectorStore.java          # Vector storage with orphan cleanup
 │   │   └── IngestedSourceRepository.java # File tracking
+│   ├── health/                         # Health indicators
+│   │   └── IngestionHealthIndicator.java # Ingestion status monitoring
 │   ├── entity/                         # JPA entities
 │   └── config/                         # Configuration classes
 ├── src/main/resources/
 │   ├── application.properties          # Configuration
 │   └── db/init.sql                     # Database schema
+├── src/test/java/                      # Test classes
+│   └── com/adlanda/contextorchestrator/
+│       ├── service/                    # Service tests
+│       └── repository/                 # Repository tests
 ├── docs/                               # Documents to ingest
 ├── docker-compose.yml                  # PostgreSQL + PGVector
 └── pom.xml                             # Maven dependencies
@@ -85,6 +92,9 @@ ai-context-orchestrator/
 |---------|-------------|
 | **Persistent Storage** | Embeddings stored in PostgreSQL with PGVector extension |
 | **Incremental Ingestion** | Only new/changed files are processed (SHA-256 hash detection) |
+| **Orphan Cleanup** | Old chunks automatically deleted when files change or are removed |
+| **File Deletion Detection** | Removed files have their chunks cleaned from the index |
+| **Health Monitoring** | Custom health indicator reports ingestion status |
 | **HNSW Index** | Fast approximate nearest neighbor search |
 | **Cost Efficient** | Avoids redundant OpenAI API calls for unchanged files |
 
@@ -130,6 +140,29 @@ docker-compose logs -f postgres
 
 # Connect to database
 docker exec -it orchestrator-postgres psql -U orchestrator -d orchestrator
+```
+
+## Health Endpoint
+
+The `/actuator/health` endpoint includes ingestion status:
+
+```json
+{
+  "status": "UP",
+  "components": {
+    "ingestion": {
+      "status": "UP",
+      "details": {
+        "lastRun": "2026-01-01T10:30:00Z",
+        "filesTracked": 15,
+        "filesProcessed": 2,
+        "filesSkipped": 13,
+        "filesDeleted": 0,
+        "chunksIndexed": 12
+      }
+    }
+  }
+}
 ```
 
 ## Tech Stack

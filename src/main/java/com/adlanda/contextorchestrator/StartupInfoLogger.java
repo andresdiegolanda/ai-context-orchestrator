@@ -1,6 +1,6 @@
 package com.adlanda.contextorchestrator;
 
-import com.adlanda.contextorchestrator.repository.InMemoryVectorStore;
+import com.adlanda.contextorchestrator.repository.IngestedSourceRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -15,7 +15,7 @@ public class StartupInfoLogger implements ApplicationRunner {
 
     private static final Logger log = LoggerFactory.getLogger(StartupInfoLogger.class);
 
-    private final InMemoryVectorStore vectorStore;
+    private final IngestedSourceRepository ingestedSourceRepository;
 
     @Value("${server.port:8080}")
     private int port;
@@ -23,16 +23,19 @@ public class StartupInfoLogger implements ApplicationRunner {
     @Value("${info.app.version:0.0.1-SNAPSHOT}")
     private String version;
 
-    public StartupInfoLogger(InMemoryVectorStore vectorStore) {
-        this.vectorStore = vectorStore;
+    public StartupInfoLogger(IngestedSourceRepository ingestedSourceRepository) {
+        this.ingestedSourceRepository = ingestedSourceRepository;
     }
 
     @Override
     public void run(ApplicationArguments args) {
+        long totalChunks = ingestedSourceRepository.sumChunkCount();
+        long totalFiles = ingestedSourceRepository.count();
+        
         log.info("""
 
             AI Context Orchestrator v{}
-            Index: {} chunks
+            Index: {} files, {} chunks
 
             API Endpoints:
               GET  http://localhost:{}/api/v1
@@ -42,7 +45,7 @@ public class StartupInfoLogger implements ApplicationRunner {
             Health:
               GET  http://localhost:{}/actuator/health
             """,
-            version, vectorStore.size(), port, port, port, port
+            version, totalFiles, totalChunks, port, port, port, port
         );
     }
 }

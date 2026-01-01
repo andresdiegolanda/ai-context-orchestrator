@@ -6,6 +6,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
 import java.util.List;
@@ -18,6 +19,7 @@ import java.util.Map;
  * a consistent interface for storing and searching document chunks.
  *
  * Iteration 2: Replaces InMemoryVectorStore with persistent PGVector storage.
+ * Iteration 2.1: Added JdbcTemplate for native SQL deletion of orphaned chunks.
  */
 @Repository
 public class PgVectorStore {
@@ -25,9 +27,11 @@ public class PgVectorStore {
     private static final Logger log = LoggerFactory.getLogger(PgVectorStore.class);
 
     private final VectorStore vectorStore;
+    private final JdbcTemplate jdbcTemplate;
 
-    public PgVectorStore(VectorStore vectorStore) {
+    public PgVectorStore(VectorStore vectorStore, JdbcTemplate jdbcTemplate) {
         this.vectorStore = vectorStore;
+        this.jdbcTemplate = jdbcTemplate;
     }
 
     /**
@@ -98,14 +102,16 @@ public class PgVectorStore {
 
     /**
      * Deletes all chunks associated with a specific source file.
-     * Used when re-ingesting a changed file.
+     * Uses native SQL since Spring AI VectorStore doesn't support metadata-based deletion.
      *
      * @param sourceFile The source file path
+     * @return Number of chunks deleted
      */
-    public void deleteBySourceFile(String sourceFile) {
-        // Note: Spring AI VectorStore doesn't directly support delete by metadata
-        // This would require a custom implementation or direct JDBC access
-        log.warn("Delete by source file not yet implemented for PGVector");
+    public int deleteBySourceFile(String sourceFile) {
+        String sql = "DELETE FROM vector_store WHERE metadata->>'sourceFile' = ?";
+        int deleted = jdbcTemplate.update(sql, sourceFile);
+        log.info("Deleted {} chunks for source file: {}", deleted, sourceFile);
+        return deleted;
     }
 
     /**

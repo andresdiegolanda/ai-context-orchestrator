@@ -13,10 +13,24 @@ import org.springframework.stereotype.Component;
 public class IngestionProperties {
 
     /**
+     * Whether ingestion is enabled at startup.
+     * When false, no documents will be ingested (useful for testing).
+     */
+    private boolean enabled = true;
+
+    /**
      * Whether to enable incremental ingestion (skip unchanged files).
      * When true, files are only re-ingested if their content hash has changed.
      */
     private boolean incremental = true;
+
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    public void setEnabled(boolean enabled) {
+        this.enabled = enabled;
+    }
 
     public boolean isIncremental() {
         return incremental;

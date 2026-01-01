@@ -4,6 +4,7 @@ import com.adlanda.contextorchestrator.config.IngestionProperties;
 import com.adlanda.contextorchestrator.entity.IngestedSource;
 import com.adlanda.contextorchestrator.model.DocumentChunk;
 import com.adlanda.contextorchestrator.repository.IngestedSourceRepository;
+import com.adlanda.contextorchestrator.repository.PgVectorStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -13,10 +14,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Optional;
-import java.util.UUID;
+import java.util.*;
 import java.util.stream.Stream;
 
 /**
@@ -25,6 +23,8 @@ import java.util.stream.Stream;
  * Iteration 2 adds:
  * - Incremental ingestion: Only process files that have changed (based on SHA-256 hash)
  * - File hash tracking: Store hashes in database to detect changes across restarts
+ * - Orphan cleanup: Delete old chunks when files are modified or deleted
+ * - Deleted file detection: Remove chunks for files that no longer exist
  */
 @Service
 public class IngestionService {
@@ -34,6 +34,7 @@ public class IngestionService {
     private final FileHashService fileHashService;
     private final IngestedSourceRepository ingestedSourceRepository;
     private final IngestionProperties ingestionProperties;
+    private final PgVectorStore pgVectorStore;
 
     @Value("${orchestrator.docs.path:./docs}")
     private String docsPath;
@@ -43,10 +44,12 @@ public class IngestionService {
 
     public IngestionService(FileHashService fileHashService,
                             IngestedSourceRepository ingestedSourceRepository,
-                            IngestionProperties ingestionProperties) {
+                            IngestionProperties ingestionProperties,
+                            PgVectorStore pgVectorStore) {
         this.fileHashService = fileHashService;
         this.ingestedSourceRepository = ingestedSourceRepository;
         this.ingestionProperties = ingestionProperties;
+        this.pgVectorStore = pgVectorStore;
     }
 
     /**
@@ -68,18 +71,41 @@ public class IngestionService {
     }
 
     /**
+     * Summary of the ingestion process.
+     */
+    public record IngestionSummary(
+            int processedFiles,
+            int skippedFiles,
+            int deletedFiles,
+            List<DocumentChunk> chunks
+    ) {
+        public int totalChunks() {
+            return chunks.size();
+        }
+
+        public boolean hasChanges() {
+            return processedFiles > 0 || deletedFiles > 0;
+        }
+    }
+
+    /**
      * Scans the configured docs directory and returns chunks from all markdown files.
      * In incremental mode, only processes files that have changed since last ingestion.
+     * Also cleans up orphaned chunks from deleted files.
      */
     @Transactional
-    public List<DocumentChunk> ingestAllDocuments() {
+    public IngestionSummary ingestAllDocumentsWithSummary() {
         Path docsDir = Path.of(docsPath);
 
         if (!Files.exists(docsDir)) {
             log.warn("Docs directory does not exist: {}", docsPath);
-            return List.of();
+            return new IngestionSummary(0, 0, 0, List.of());
         }
 
+        // Phase 1: Clean up deleted files
+        int deletedFiles = cleanupDeletedFiles(docsDir);
+
+        // Phase 2: Process current files
         List<DocumentChunk> allChunks = new ArrayList<>();
         int skippedCount = 0;
         int processedCount = 0;
@@ -87,7 +113,7 @@ public class IngestionService {
         try (Stream<Path> paths = Files.walk(docsDir)) {
             List<Path> files = paths
                     .filter(Files::isRegularFile)
-                    .filter(p -> p.toString().endsWith(".md") || p.toString().endsWith(".txt"))
+                    .filter(this::isSupportedFile)
                     .toList();
 
             for (Path path : files) {
@@ -109,20 +135,81 @@ public class IngestionService {
             log.error("Failed to walk docs directory: {}", docsPath, e);
         }
 
-        log.info("Ingestion complete: {} files processed, {} skipped (unchanged), {} total chunks",
-                processedCount, skippedCount, allChunks.size());
-        return allChunks;
+        log.info("Ingestion complete: {} files processed, {} skipped (unchanged), {} deleted, {} total chunks",
+                processedCount, skippedCount, deletedFiles, allChunks.size());
+        
+        return new IngestionSummary(processedCount, skippedCount, deletedFiles, allChunks);
+    }
+
+    /**
+     * Scans the configured docs directory and returns chunks from all markdown files.
+     * Backward compatible method that returns just the chunks list.
+     */
+    @Transactional
+    public List<DocumentChunk> ingestAllDocuments() {
+        return ingestAllDocumentsWithSummary().chunks();
+    }
+
+    /**
+     * Cleans up chunks and records for files that have been deleted from disk.
+     *
+     * @param docsDir The docs directory to scan
+     * @return Number of deleted files cleaned up
+     */
+    private int cleanupDeletedFiles(Path docsDir) {
+        // Get current files on disk
+        Set<String> currentFiles = new HashSet<>();
+        try (Stream<Path> paths = Files.walk(docsDir)) {
+            paths.filter(Files::isRegularFile)
+                 .filter(this::isSupportedFile)
+                 .forEach(p -> currentFiles.add(
+                     docsDir.relativize(p).toString().replace("\\", "/")
+                 ));
+        } catch (IOException e) {
+            log.warn("Error scanning documents directory for cleanup: {}", e.getMessage());
+            return 0;
+        }
+
+        // Find and remove orphaned records
+        int deletedCount = 0;
+        List<IngestedSource> allSources = ingestedSourceRepository.findAll();
+
+        for (IngestedSource source : allSources) {
+            String normalizedPath = source.getFilePath().replace("\\", "/");
+            if (!currentFiles.contains(normalizedPath)) {
+                log.info("File '{}' no longer exists, removing {} chunks from index",
+                        source.getFilePath(), source.getChunkCount());
+                pgVectorStore.deleteBySourceFile(source.getFilePath());
+                ingestedSourceRepository.delete(source);
+                deletedCount++;
+            }
+        }
+
+        if (deletedCount > 0) {
+            log.info("Cleaned up {} deleted files from index", deletedCount);
+        }
+
+        return deletedCount;
+    }
+
+    /**
+     * Checks if a file is supported for ingestion.
+     */
+    private boolean isSupportedFile(Path path) {
+        String name = path.toString().toLowerCase();
+        return name.endsWith(".md") || name.endsWith(".txt") || name.endsWith(".adoc");
     }
 
     /**
      * Processes a single file, checking if it needs to be re-ingested.
+     * Deletes old chunks before re-ingesting changed files.
      *
      * @param filePath Path to the file
      * @return Result containing chunks (if processed) or skip reason
      */
     @Transactional
     public FileIngestionResult processFile(Path filePath) throws IOException {
-        String relativePath = Path.of(docsPath).relativize(filePath).toString();
+        String relativePath = Path.of(docsPath).relativize(filePath).toString().replace("\\", "/");
         String currentHash = fileHashService.computeHash(filePath);
         long fileSize = fileHashService.getFileSize(filePath);
 
@@ -133,24 +220,22 @@ public class IngestionService {
                 return FileIngestionResult.skipped(relativePath, "unchanged");
             }
 
-            // Check if file exists but has changed
+            // Check if file exists but has changed - delete old chunks first
             Optional<IngestedSource> existingSource = ingestedSourceRepository.findByFilePath(relativePath);
             if (existingSource.isPresent()) {
-                log.info("File {} has changed, re-ingesting...", relativePath);
-                // Will be handled by the caller - old chunks need to be deleted
+                IngestedSource source = existingSource.get();
+                log.info("File {} has changed, deleting {} old chunks before re-ingesting...", 
+                        relativePath, source.getChunkCount());
+                pgVectorStore.deleteBySourceFile(relativePath);
+                ingestedSourceRepository.delete(source);
             }
         }
 
         // Read and chunk the file
         List<DocumentChunk> chunks = ingestFile(filePath, currentHash);
 
-        // Update or create the ingested source record
-        IngestedSource source = ingestedSourceRepository.findByFilePath(relativePath)
-                .orElse(new IngestedSource(relativePath, currentHash, fileSize, chunks.size()));
-
-        source.setFileHash(currentHash);
-        source.setFileSize(fileSize);
-        source.setChunkCount(chunks.size());
+        // Create new ingested source record
+        IngestedSource source = new IngestedSource(relativePath, currentHash, fileSize, chunks.size());
         ingestedSourceRepository.save(source);
 
         return FileIngestionResult.ingested(relativePath, chunks);
@@ -165,7 +250,7 @@ public class IngestionService {
      */
     public List<DocumentChunk> ingestFile(Path filePath, String fileHash) throws IOException {
         String content = Files.readString(filePath);
-        String relativePath = Path.of(docsPath).relativize(filePath).toString();
+        String relativePath = Path.of(docsPath).relativize(filePath).toString().replace("\\", "/");
 
         return chunkContent(content, relativePath, fileHash);
     }

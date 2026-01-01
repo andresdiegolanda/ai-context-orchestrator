@@ -3,6 +3,7 @@ package com.adlanda.contextorchestrator.service;
 import com.adlanda.contextorchestrator.config.IngestionProperties;
 import com.adlanda.contextorchestrator.model.DocumentChunk;
 import com.adlanda.contextorchestrator.repository.IngestedSourceRepository;
+import com.adlanda.contextorchestrator.repository.PgVectorStore;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -27,11 +28,14 @@ class IngestionServiceTest {
     @Mock
     private IngestionProperties ingestionProperties;
 
+    @Mock
+    private PgVectorStore pgVectorStore;
+
     private IngestionService ingestionService;
 
     @BeforeEach
     void setUp() {
-        ingestionService = new IngestionService(fileHashService, ingestedSourceRepository, ingestionProperties);
+        ingestionService = new IngestionService(fileHashService, ingestedSourceRepository, ingestionProperties, pgVectorStore);
         // Mock hash computation to return a fixed hash for content-based calls
         when(fileHashService.computeHash(anyString())).thenReturn("test-hash");
     }

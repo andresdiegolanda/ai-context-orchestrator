@@ -19,7 +19,8 @@ import static org.mockito.Mockito.when;
 @SpringBootTest
 @TestPropertySource(properties = {
     "spring.ai.openai.api-key=test-key",
-    "orchestrator.docs.path=./docs"
+    "orchestrator.docs.path=./docs",
+    "orchestrator.ingestion.enabled=false"  // Disable ingestion during tests
 })
 class OrchestratorApplicationTests {
 

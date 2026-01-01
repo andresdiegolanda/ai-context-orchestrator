@@ -12,7 +12,10 @@ This document explains the implementation of Iteration 2, which replaces the in-
 1. **Persistent Vector Storage**: Embeddings survive application restarts
 2. **Incremental Ingestion**: Only new or changed files are processed
 3. **File Hash Tracking**: SHA-256 hashes detect file changes
-4. **PostgreSQL Integration**: Uses PGVector extension for vector similarity search
+4. **Orphan Cleanup**: Old chunks deleted when files change or are removed
+5. **File Deletion Detection**: Chunks removed when source files are deleted
+6. **Health Monitoring**: Custom health indicator for ingestion status
+7. **PostgreSQL Integration**: Uses PGVector extension for vector similarity search
 
 ```plantuml
 @startuml
@@ -36,6 +39,8 @@ end note
 note bottom of iter2
   - Embeddings persisted
   - Only changed files processed
+  - Orphans cleaned up
+  - Health monitoring
   - Production-ready
 end note
 
@@ -106,7 +111,7 @@ mvn spring-boot:run
 
 On first startup:
 1. Spring AI creates the vector table automatically
-2. The init.sql script creates additional tables for tracking ingested sources
+2. The init.sql script creates the `ingested_sources` tracking table
 3. All documents in `docs/` are ingested and embedded
 4. Embeddings are stored in PostgreSQL
 
@@ -122,7 +127,7 @@ mvn spring-boot:run
 On second startup, you should see:
 ```
 INFO  - Starting document ingestion...
-INFO  - No new or changed documents to ingest
+INFO  - No changes detected. Index is up to date (X files tracked)
 ```
 
 This confirms that unchanged files are skipped!
@@ -132,6 +137,13 @@ This confirms that unchanged files are skipped!
 1. Edit any file in `docs/` (e.g., add a space)
 2. Restart the application
 3. You should see only that file being re-ingested
+4. Old chunks are automatically deleted before new ones are stored
+
+### Step 5: Test File Deletion Detection
+
+1. Delete a file from `docs/`
+2. Restart the application
+3. You should see the file's chunks being removed from the index
 
 ---
 
@@ -169,16 +181,17 @@ title Iteration 2: Persistent Storage with PGVector
 component "IngestionRunner" as runner
 component "IngestionService" as ingest
 component "FileHashService" as hash
-component "EmbeddingService" as embed
 component "PgVectorStore" as pgvector
+component "IngestionHealthIndicator" as health
 database "PostgreSQL\n+ PGVector" as postgres
 
-runner --> ingest : Read files
+runner --> ingest : Read & chunk files
 ingest --> hash : Compute SHA-256
 hash --> ingest : Check if changed
-ingest --> embed : Chunk text (new only)
-embed --> pgvector : Store vectors
+ingest --> pgvector : Delete old chunks (if changed)
+ingest --> pgvector : Store new chunks
 pgvector --> postgres : Persist
+runner --> health : Report status
 
 note bottom of postgres
   Vectors stored in:
@@ -267,19 +280,26 @@ public interface IngestedSourceRepository extends JpaRepository<IngestedSource, 
 
 **File:** `src/main/java/com/adlanda/contextorchestrator/repository/PgVectorStore.java`
 
-Wrapper around Spring AI's VectorStore for PGVector operations.
+Wrapper around Spring AI's VectorStore with native SQL support for orphan cleanup.
 
 ```java
 @Repository
 public class PgVectorStore {
 
-    private final VectorStore vectorStore;  // Spring AI auto-configured
+    private final VectorStore vectorStore;
+    private final JdbcTemplate jdbcTemplate;
 
     public void storeAll(List<DocumentChunk> chunks) {
         List<Document> documents = chunks.stream()
                 .map(this::toDocument)
                 .toList();
         vectorStore.add(documents);
+    }
+
+    public int deleteBySourceFile(String sourceFile) {
+        // Native SQL for metadata-based deletion
+        String sql = "DELETE FROM vector_store WHERE metadata->>'sourceFile' = ?";
+        return jdbcTemplate.update(sql, sourceFile);
     }
 
     public List<ScoredChunk> findSimilarByText(String queryText, int maxResults) {
@@ -290,7 +310,27 @@ public class PgVectorStore {
 }
 ```
 
-### 5. IngestionProperties
+### 5. IngestionHealthIndicator
+
+**File:** `src/main/java/com/adlanda/contextorchestrator/health/IngestionHealthIndicator.java`
+
+Custom health indicator for monitoring ingestion status.
+
+```java
+@Component
+public class IngestionHealthIndicator implements HealthIndicator {
+
+    public void markHealthy(IngestionSummary summary) { ... }
+    public void markUnhealthy(String error) { ... }
+
+    @Override
+    public Health health() {
+        // Returns UP with file counts, or DOWN with error details
+    }
+}
+```
+
+### 6. IngestionProperties
 
 **File:** `src/main/java/com/adlanda/contextorchestrator/config/IngestionProperties.java`
 
@@ -314,7 +354,7 @@ Tracks metadata about ingested files.
 
 ```sql
 CREATE TABLE ingested_sources (
-    id UUID PRIMARY KEY,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     file_path VARCHAR(500) UNIQUE NOT NULL,
     file_hash VARCHAR(64) NOT NULL,      -- SHA-256 hash
     file_size BIGINT,
@@ -354,6 +394,9 @@ start
 
 :Scan docs/ folder;
 
+:Clean up deleted files;
+note right: Remove chunks for files\nthat no longer exist
+
 while (More files?) is (yes)
     :Read file path;
     :Compute SHA-256 hash;
@@ -362,18 +405,19 @@ while (More files?) is (yes)
         :Skip file (unchanged);
     else (no)
         if (Path exists in DB?) then (yes)
-            :File changed - mark for update;
+            :Delete old chunks first;
+            :File changed - re-ingest;
         else (no)
-            :New file - mark for ingestion;
+            :New file - ingest;
         endif
 
         :Read and chunk file;
-        :Generate embeddings via OpenAI;
-        :Store in PGVector;
-        :Update ingested_sources record;
+        :Store chunks (Spring AI embeds);
+        :Save ingested_sources record;
     endif
 endwhile (no)
 
+:Update health indicator;
 :Log summary;
 
 stop
@@ -393,16 +437,19 @@ spring.datasource.url=jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${D
 spring.datasource.username=${DB_USER:orchestrator}
 spring.datasource.password=${DB_PASSWORD:orchestrator}
 
-# JPA settings
+# Schema Management
+# JPA validates ingested_sources table (created by init.sql)
 spring.jpa.hibernate.ddl-auto=validate
+
+# Spring AI auto-creates vector_store table
+spring.ai.vectorstore.pgvector.initialize-schema=true
 
 # Spring AI PGVector settings
 spring.ai.vectorstore.pgvector.index-type=HNSW
 spring.ai.vectorstore.pgvector.distance-type=COSINE_DISTANCE
 spring.ai.vectorstore.pgvector.dimensions=1536
-spring.ai.vectorstore.pgvector.initialize-schema=true
 
-# Enable incremental ingestion
+# Enable incremental ingestion with orphan cleanup
 orchestrator.ingestion.incremental=true
 ```
 
@@ -419,16 +466,62 @@ orchestrator.ingestion.incremental=true
 
 ---
 
+## Health Monitoring
+
+The application exposes ingestion health via Spring Actuator:
+
+```bash
+curl http://localhost:8080/actuator/health
+```
+
+**Healthy Response:**
+```json
+{
+  "status": "UP",
+  "components": {
+    "ingestion": {
+      "status": "UP",
+      "details": {
+        "lastRun": "2026-01-01T10:30:00Z",
+        "filesTracked": 15,
+        "filesProcessed": 2,
+        "filesSkipped": 13,
+        "filesDeleted": 0,
+        "chunksIndexed": 12
+      }
+    }
+  }
+}
+```
+
+**Unhealthy Response:**
+```json
+{
+  "status": "DOWN",
+  "components": {
+    "ingestion": {
+      "status": "DOWN",
+      "details": {
+        "error": "Database error during ingestion: Connection refused",
+        "lastAttempt": "2026-01-01T10:30:00Z"
+      }
+    }
+  }
+}
+```
+
+---
+
 ## Debugging Guide
 
 ### Breakpoints for Incremental Ingestion
 
-| # | Class | Method | Line | What to Inspect |
-|---|-------|--------|------|-----------------|
-| 1 | `IngestionService` | `processFile()` | 124 | File path and computed hash |
-| 2 | `IngestionService` | `processFile()` | 132 | Result of `existsByFilePathAndFileHash()` |
-| 3 | `FileHashService` | `computeHash()` | 33 | The computed hash value |
-| 4 | `IngestedSourceRepository` | - | - | Database queries in debugger |
+| # | Class | Method | What to Inspect |
+|---|-------|--------|-----------------|
+| 1 | `IngestionService` | `processFile()` | File path and computed hash |
+| 2 | `IngestionService` | `cleanupDeletedFiles()` | Files being removed |
+| 3 | `PgVectorStore` | `deleteBySourceFile()` | Orphan chunk deletion |
+| 4 | `FileHashService` | `computeHash()` | The computed hash value |
 
 ### Common Issues
 
@@ -438,6 +531,20 @@ orchestrator.ingestion.incremental=true
 | All files re-ingested | No skipping on restart | Wrong database URL | Check `spring.datasource.url` |
 | Empty results | Query returns nothing | Table not initialized | Set `spring.ai.vectorstore.pgvector.initialize-schema=true` |
 | Hash mismatch | File keeps re-ingesting | File modified each time | Check for auto-formatters or line ending changes |
+| Orphaned chunks | Old data in results | Upgrade from old version | Run cleanup SQL below |
+
+### Cleanup Script for Orphaned Data
+
+If upgrading from a version without orphan cleanup:
+
+```sql
+-- Remove chunks for files no longer in ingested_sources
+DELETE FROM vector_store v
+WHERE NOT EXISTS (
+    SELECT 1 FROM ingested_sources s 
+    WHERE s.file_path = v.metadata->>'sourceFile'
+);
+```
 
 ---
 
@@ -475,7 +582,7 @@ docker exec -it orchestrator-postgres psql -U orchestrator -d orchestrator -c "S
 1. Start app and ingest documents
 2. Stop app
 3. Restart app
-4. Verify: "No new or changed documents to ingest"
+4. Verify: "No changes detected. Index is up to date"
 5. Query documents - should return results from DB
 
 ### Test 2: Change Detection
@@ -484,6 +591,7 @@ docker exec -it orchestrator-postgres psql -U orchestrator -d orchestrator -c "S
 2. Edit a file in `docs/`
 3. Restart app
 4. Verify: Only the changed file is re-ingested
+5. Verify: Old chunks deleted before new ones stored
 
 ### Test 3: New File Detection
 
@@ -491,6 +599,20 @@ docker exec -it orchestrator-postgres psql -U orchestrator -d orchestrator -c "S
 2. Add a new `.md` file to `docs/`
 3. Restart app
 4. Verify: Only the new file is ingested
+
+### Test 4: File Deletion Detection
+
+1. Start app (documents already ingested)
+2. Delete a file from `docs/`
+3. Restart app
+4. Verify: File's chunks removed from index
+5. Query - should not return results from deleted file
+
+### Test 5: Health Endpoint
+
+1. Start app successfully
+2. Check `curl http://localhost:8080/actuator/health`
+3. Verify: Ingestion shows status "UP" with file counts
 
 ---
 
@@ -504,6 +626,24 @@ docker exec -it orchestrator-postgres psql -U orchestrator -d orchestrator -c "S
 | Persistence | No | Yes |
 | Scalability | Limited by RAM | Limited by disk |
 | Cost efficiency | Re-embeds every time | Embeds only new/changed |
+| Orphan handling | N/A (in-memory) | Automatic cleanup |
+
+---
+
+## Unit Tests
+
+The following test classes verify the incremental ingestion functionality:
+
+| Test Class | Purpose |
+|------------|---------|
+| `FileHashServiceTest` | SHA-256 hash computation |
+| `PgVectorStoreTest` | Vector storage and orphan deletion |
+| `IngestionServiceIncrementalTest` | Change detection, deletion, cleanup |
+
+Run tests with:
+```bash
+mvn test
+```
 
 ---
 
@@ -513,8 +653,12 @@ Iteration 2 transforms the AI Context Orchestrator from a prototype into a produ
 
 1. **Persistent Storage**: Embeddings survive restarts using PostgreSQL + PGVector
 2. **Cost Efficient**: Incremental ingestion avoids redundant OpenAI API calls
-3. **Production Ready**: Uses industry-standard PostgreSQL infrastructure
-4. **Debuggable**: Clear logging shows what's being skipped vs. ingested
+3. **Orphan Cleanup**: Old chunks deleted when files change (no stale data)
+4. **Deletion Detection**: Chunks removed when source files are deleted
+5. **Health Monitoring**: Custom health indicator for production observability
+6. **Tested**: Unit tests for all new functionality
+7. **Production Ready**: Uses industry-standard PostgreSQL infrastructure
+8. **Debuggable**: Clear logging shows what's being skipped vs. ingested
 
 **Next Steps (Iteration 3):**
 - Smarter markdown-aware chunking
